@@ -501,11 +501,7 @@ class CausalSelfAttention(nn.Module):
 
         print("Using AdaSplash with alpha =", self.alpha)
         # Choose AdaSplash function based on alpha value
-        if self.block_sparse == "auto":
-            # Use block mask for alpha >= 1.5, which is more sparse and thus faster
-            adasplash_fn = adasplash if self.alpha >= 1.5 else adasplash_no_block_mask
-        else:
-            adasplash_fn = adasplash if self.block_sparse else adasplash_no_block_mask
+        adasplash_fn = adasplash if self.alpha >= 1.5 else adasplash_no_block_mask
 
         # Apply AdaSplash attention (causal by default for LLM training)
         y = adasplash_fn(
