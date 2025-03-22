@@ -18,6 +18,11 @@ from typing_extensions import Self
 from litgpt.config import Config
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
+try:
+    from adasplash import adasplash, adasplash_no_block_mask
+except ImportError:
+    raise ImportError("Please install adasplash first via `pip install adasplash`")
+
 
 class GPT(nn.Module):
     def __init__(self, config: Config) -> None:
@@ -350,6 +355,7 @@ class CausalSelfAttention(nn.Module):
 
         self.config = config
         self.block_idx = block_idx
+        self.alpha = getattr(config, "alpha", 1.0)
 
     def forward(
         self,
@@ -449,7 +455,10 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        y = self.scaled_dot_product_attention(q, k, v, mask)
+        if self.alpha == 1.0:
+            y = self.scaled_dot_product_attention(q, k, v, mask)
+        else:
+            y = self.adasplash_scaled_dot_product_attention(q, k, v, mask)
 
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, head_size * n_head)
@@ -476,6 +485,36 @@ class CausalSelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
             )
+        return y.transpose(1, 2)
+
+    def adasplash_scaled_dot_product_attention(
+            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+
+        # Calculate varlen for varying sequence lengths (needed by AdaSplash)
+        if mask is not None:
+            valid_mask = mask.eq(True) if mask.dtype == torch.bool else mask.eq(0)
+            varlen = valid_mask.sum(-1).long().contiguous()
+        else:
+            B, T = q.shape[:2]
+            varlen = torch.full((B,), T, dtype=torch.long, device=q.device)
+
+        print("Using AdaSplash with alpha =", self.alpha)
+        # Choose AdaSplash function based on alpha value
+        if self.block_sparse == "auto":
+            # Use block mask for alpha >= 1.5, which is more sparse and thus faster
+            adasplash_fn = adasplash if self.alpha >= 1.5 else adasplash_no_block_mask
+        else:
+            adasplash_fn = adasplash if self.block_sparse else adasplash_no_block_mask
+
+        # Apply AdaSplash attention (causal by default for LLM training)
+        y = adasplash_fn(
+            q, k, v,
+            alpha=self.alpha,
+            is_causal=True,
+            varlen=varlen,
+            niter=4,
+        )
         return y.transpose(1, 2)
 
     def build_kv_cache(

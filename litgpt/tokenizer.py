@@ -18,6 +18,8 @@ class Tokenizer:
         self.use_bos = self.check_if_bos_token_used(checkpoint_dir)
         self.bos_id = None
         self.eos_id = None
+        self.pad_id = None
+        self.unk_id = None
 
         # some checkpoints have both files, `.json` takes precedence
         if (vocabulary_path := checkpoint_dir / "tokenizer.json").is_file():
@@ -31,12 +33,20 @@ class Tokenizer:
                     config = json.load(fp)
                 bos_token = config.get("bos_token")
                 eos_token = config.get("eos_token")
+                pad_token = config.get("pad_token")
+                unk_token = config.get("unk_token")
                 if bos_token is not None and isinstance(bos_token, dict):
                     bos_token = bos_token.get("content")
                 if eos_token is not None and isinstance(eos_token, dict):
                     eos_token = eos_token.get("content")
+                if pad_token is not None and isinstance(pad_token, dict):
+                    pad_token = pad_token.get("content")
+                if unk_token is not None and isinstance(unk_token, dict):
+                    unk_token = unk_token.get("content")
                 self.bos_id = self.token_to_id(bos_token) if bos_token is not None else None
                 self.eos_id = self.token_to_id(eos_token) if eos_token is not None else None
+                self.pad_id = self.token_to_id(pad_token) if pad_token is not None else None
+                self.unk_id = self.token_to_id(unk_token) if unk_token is not None else None
             if (special_tokens_path := checkpoint_dir / "generation_config.json").is_file():
                 try:
                     with open(special_tokens_path, encoding="utf-8") as fp:
@@ -49,6 +59,10 @@ class Tokenizer:
                     self.bos_id = config.get("bos_token_id")
                 if self.eos_id is None:
                     self.eos_id = config.get("eos_token_id")
+                if self.pad_id is None:
+                    self.pad_id = config.get("pad_token_id")
+                if self.unk_id is None:
+                    self.unk_id = config.get("unk_token_id")
 
         elif (vocabulary_path := checkpoint_dir / "tokenizer.model").is_file():
             from sentencepiece import SentencePieceProcessor
@@ -57,6 +71,8 @@ class Tokenizer:
             self.backend = "sentencepiece"
             self.bos_id = self.processor.bos_id()
             self.eos_id = self.processor.eos_id()
+            self.pad_id = self.processor.pad_id()
+            self.unk_id = self.processor.unk_id()
         else:
             raise NotImplementedError
 

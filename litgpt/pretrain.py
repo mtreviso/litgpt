@@ -1,12 +1,14 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 import math
+import os
 import pprint
+import sys
 import time
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
-from typing import Optional, Tuple, Union, Dict
+from typing import Any, Callable, Optional, Tuple, Union, List, Dict
 
 import lightning as L
 import torch
@@ -18,6 +20,7 @@ from torchmetrics.aggregation import RunningMean
 from typing_extensions import Literal
 
 from litgpt import Tokenizer
+from litgpt.alpha_scheduler import AlphaScheduler
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.data import DataModule, TinyLlama
@@ -66,8 +69,12 @@ def setup(
     devices: Union[int, str] = "auto",
     num_nodes: int = 1,
     tokenizer_dir: Optional[Path] = None,
-    logger_name: Literal["wandb", "tensorboard", "csv"] = "tensorboard",
+    logger_name: Literal["wandb", "tensorboard", "csv", "comet"] = "tensorboard",
     seed: int = 42,
+    compiler: Optional[Literal["thunder", "torch"]] = None,
+    executors: Optional[List[str]] = ("sdpa", "torchcompile", "torch"),
+    strategy: Literal["auto", "ddp", "fsdp"] = "fsdp",
+    callbacks: Optional[List[str]] = None,
 ):
     """Pretrain a model.
 
@@ -87,13 +94,16 @@ def setup(
         train: Training-related arguments. See ``litgpt.args.TrainArgs`` for details.
         eval: Evaluation-related arguments. See ``litgpt.args.EvalArgs`` for details.
         optimizer: An optimizer name (such as "AdamW") or config.
-
         devices: How many devices/GPUs to use. Uses all GPUs by default.
         num_nodes: How many nodes the code is being run on.
         tokenizer_dir: Optional path to the tokenizer dir that was used for preprocessing the dataset. Only some data
             module require this.
         logger_name: The name of the logger to send metrics to.
         seed: The random seed to use for reproducibility.
+        compiler: If desired, the compiler/JIT to use.
+        executors: If using Thunder, the executors to enable.
+        strategy: If desired, the strategy to use.
+        callbacks: If desired, the callbacks to use.
     """
     if model_name == "list":
         available_models = "\n".join(sorted(name_to_config))
@@ -131,7 +141,22 @@ def setup(
     )
 
     if devices * num_nodes > 1:
-        strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+        if compiler == "thunder":
+            if strategy == "fsdp":
+                from extensions.thunder.strategies import ThunderFSDPStrategy
+
+                strategy = ThunderFSDPStrategy(
+                    sharding_strategy="ZERO3", bucketing_strategy="BLOCK", state_dict_type="full", jit=False,
+                )
+            elif strategy == "ddp":
+                from extensions.thunder.strategies import ThunderDDPStrategy
+
+                strategy = ThunderDDPStrategy(jit=False)
+        else:
+            if strategy == "fsdp":
+                strategy = FSDPStrategy(
+                    auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="FULL_SHARD"
+                )
     else:
         strategy = "auto"
 
@@ -140,7 +165,8 @@ def setup(
         num_nodes=num_nodes,
         strategy=strategy,
         precision=precision,
-        loggers=[logger]
+        loggers=[logger],
+        callbacks=callbacks,
     )
 
     if torch.cuda.is_available() and devices > 1:
@@ -148,8 +174,20 @@ def setup(
 
     fabric.launch()
 
+    if compiler is not None:
+        global forward_and_loss
+        if compiler == "thunder" or compiler == "auto":
+            try:
+                forward_and_loss = jit(forward_and_loss, executors)
+            except Exception as e:
+                print(f"Failed to compile the forward_and_loss function: {e}")
+                print("Trying to compile with torch instead.")
+                forward_and_loss = torch.compile(forward_and_loss)
+        else:
+            forward_and_loss = torch.compile(forward_and_loss)
+
     fabric.print(pprint.pformat(hparams))
-    if logger_name in ("tensorboard", "wandb"):
+    if logger_name in ("tensorboard", "wandb", "comet"):
         fabric.logger.log_hyperparams(hparams)
 
     main(
@@ -167,6 +205,7 @@ def setup(
         train=train,
         eval=eval,
         optimizer=optimizer,
+        compiler=compiler,
     )
 
 
@@ -184,6 +223,7 @@ def main(
     train: TrainArgs,
     eval: EvalArgs,
     optimizer: Union[str, Dict],
+    compiler: Optional[Literal["thunder", "torch"]],
     num_nodes: int = 1,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
@@ -207,9 +247,10 @@ def main(
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
-    model = torch.compile(model)
     model = fabric.setup(model)
-
+    if compiler == "thunder":
+        # avoid `Tensor.register_hook` which is unsupported
+        model._register_backward_hook = lambda *_: None
     extra_kwargs = {"fused": fabric.device.type == "cuda"}
     optimizer = instantiate_torch_optimizer(optimizer, model.parameters(), **extra_kwargs)
     optimizer = fabric.setup_optimizers(optimizer)
@@ -309,6 +350,14 @@ def fit(
     total_t0 = time.perf_counter()
 
     warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
+    alpha_scheduler = AlphaScheduler(
+        initial_alpha=1.01, final_alpha=1.5, max_steps=max_iters // 2, strategy="linear"
+    )
+    # go over each attention layer and set the alpha value
+    for block in model.transformer.h:
+        block.attn.alpha = alpha_scheduler.alpha
+
+    print("Max iters: ", max_iters)
 
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
@@ -322,13 +371,12 @@ def fit(
         state["iter_num"] += 1
         iter_t0 = time.perf_counter()
 
-        input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
-        targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+        input_ids = train_data['input_ids'].contiguous().long()
+        targets = train_data['labels'].contiguous().long()
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets)
+            loss = forward_and_loss(model, input_ids, targets)
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
         running_loss.update(loss.detach())
@@ -338,6 +386,12 @@ def fit(
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
+
+            alpha_scheduler.step()
+
+            # go over each attention layer and set the alpha value
+            for block in model.transformer.h:
+                block.attn.alpha = alpha_scheduler.alpha
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
@@ -365,7 +419,7 @@ def fit(
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
-                f"Epoch {metrics['epoch']+1} | iter {metrics['iter']} step {metrics['step']} |"
+                f"Epoch {metrics['epoch']+1} | iter {metrics['iter']}/{max_iters} step {metrics['step']} |"
                 f" loss train: {metrics['loss']:.3f},"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
@@ -399,6 +453,13 @@ def fit(
         fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
 
+def forward_and_loss(model: nn.Module, input_ids: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    logits = model(input_ids)
+    # disable chunk_size to enable the unsloth cross entropy kernel
+    loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+    return loss
+
+
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int, verbose: bool = True) -> torch.Tensor:
     fabric.barrier()
@@ -410,10 +471,9 @@ def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max
     for k, batch in enumerate(val_dataloader):
         if k >= max_iters:
             break
-        input_ids = batch[:, 0 : model.max_seq_length].contiguous().long()
-        targets = batch[:, 1 : (model.max_seq_length + 1)].contiguous().long()
-        logits = model(input_ids)
-        loss = chunked_cross_entropy(logits, targets)
+        input_ids = batch['input_ids'].contiguous().long()
+        targets = batch['labels'].contiguous().long()
+        loss = forward_and_loss(model, input_ids, targets)
         losses.append(loss)
 
     val_loss = torch.stack(losses).mean()
@@ -499,3 +559,14 @@ def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resu
         issues.append("Can't provide both `--resume` and `--initial_checkpoint_dir`. Choose one.")
     if issues:
         raise ValueError("\n".join(issues))
+
+
+def jit(fn: Callable, executors: List[str]) -> Any:
+    assert executors is not None
+    try:
+        import thunder
+        from litgpt.unsloth.executor import unsloth_ex  # import for registration  # noqa: F401
+    except ImportError:
+        raise ImportError("Thunder is required to use JIT compilation.")
+
+    return thunder.jit(fn, executors=executors)

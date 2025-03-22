@@ -3,6 +3,7 @@
 import logging
 import re
 
+import comet_ml
 from litgpt.api import LLM
 from litgpt.model import GPT  # needs to be imported before config
 from litgpt.config import Config

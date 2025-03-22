@@ -28,11 +28,11 @@ import yaml
 from lightning.fabric.loggers import CSVLogger, TensorBoardLogger
 from lightning.fabric.strategies import FSDPStrategy
 from lightning.fabric.utilities.load import _lazy_load as lazy_load
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import WandbLogger, CometLogger
 from lightning.pytorch.cli import instantiate_class
 from torch.serialization import normalize_storage_type
 from typing_extensions import Self
-
+from wandb.sdk.lib.apikey import api_key
 
 if TYPE_CHECKING:
     from litgpt import GPT, Config
@@ -527,7 +527,7 @@ def parse_devices(devices: Union[str, int]) -> int:
 
 
 def choose_logger(
-    logger_name: Literal["csv", "tensorboard", "wandb"],
+    logger_name: Literal["csv", "tensorboard", "wandb", "comet"],
     out_dir: Path,
     name: str,
     log_interval: int = 1,
@@ -540,7 +540,16 @@ def choose_logger(
         return TensorBoardLogger(root_dir=(out_dir / "logs"), name="tensorboard", **kwargs)
     if logger_name == "wandb":
         return WandbLogger(project=name, resume=resume, **kwargs)
-    raise ValueError(f"`--logger_name={logger_name}` is not a valid option. Choose from 'csv', 'tensorboard', 'wandb'.")
+    if logger_name == "comet":
+        return CometLogger(
+            project=name,
+            workspace=os.environ.get("COMET_WORKSPACE"),
+            api_key=os.environ.get("COMET_API_KEY"),
+            **kwargs
+        )
+
+    valid_options = "'csv', 'tensorboard', 'wandb', 'comet'"
+    raise ValueError(f"`--logger_name={logger_name}` is not a valid option. Choose from {valid_options}.")
 
 
 def get_argument_names(cls):

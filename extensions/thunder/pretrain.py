@@ -72,6 +72,7 @@ def setup(
     compiler: Optional[Literal["thunder", "torch"]] = "thunder",
     executors: Optional[List[str]] = ("sdpa", "torchcompile", "nvfuser", "torch"),
     strategy: Literal["auto", "ddp", "fsdp"] = "fsdp",
+    callbacks: Optional[List[str]] = None,
 ):
     """Pretrain a model.
 
@@ -136,7 +137,13 @@ def setup(
                 )
     else:
         strategy = "auto"
-    fabric = L.Fabric(devices=devices, num_nodes=num_nodes, strategy=strategy, precision="bf16-true", loggers=[logger])
+    fabric = L.Fabric(
+        devices=devices,
+        num_nodes=num_nodes,
+        strategy=strategy,
+        precision="bf16-true",
+        loggers=[logger]
+    )
     fabric.launch()
 
     if compiler is not None:
@@ -255,7 +262,7 @@ def fit(
     tokenizer_dir: Optional[Path],
     train: TrainArgs,
     eval: EvalArgs,
-    optimizer: Union[str, Dict],
+    optimizer = None,
     num_nodes: int = 1,
 ) -> None:
     model = state["model"]
