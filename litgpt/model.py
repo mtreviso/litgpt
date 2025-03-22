@@ -499,9 +499,13 @@ class CausalSelfAttention(nn.Module):
             B, T = q.shape[:2]
             varlen = torch.full((B,), T, dtype=torch.long, device=q.device)
 
-        print("Using AdaSplash with alpha =", self.alpha)
         # Choose AdaSplash function based on alpha value
         adasplash_fn = adasplash if self.alpha >= 1.5 else adasplash_no_block_mask
+
+        # Make sure the tensors are contiguous for AdaSplash
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
         # Apply AdaSplash attention (causal by default for LLM training)
         y = adasplash_fn(
